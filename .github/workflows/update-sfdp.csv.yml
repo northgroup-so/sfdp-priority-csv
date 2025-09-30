@@ -1,4 +1,4 @@
-name: Update SFDP CSV (PR + Auto-merge via PAT)
+name: Update SFDP CSV
 
 on:
     schedule:
