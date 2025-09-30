@@ -6,7 +6,8 @@ on:
     workflow_dispatch:
 
 permissions:
-    contents: write
+    contents: read
+    pull-requests: read
 
 jobs:
     update:
@@ -15,39 +16,136 @@ jobs:
         steps:
             - name: Checkout
               uses: actions/checkout@v4
-
-            - name: Install jq (ensure available)
-              run: |
-                  sudo apt-get update
-                  sudo apt-get install -y jq
+              with:
+                  fetch-depth: 0
 
             - name: Generate CSV files
               shell: bash
               run: |
+                  set -euo pipefail
                   mkdir -p data
-                  # main CSV (overwrites)
                   curl --silent --location 'https://api.solana.org/api/community/v1/sfdp_participants' \
-                  | jq -r '["No","Mainnet Pubkey","state","Onboarding Priority","Onboarded @ Epoch"],
+                  | jq -r '["No","Mainnet Pubkey","Testnet Pubkey","state","Onboarding Priority","Onboarded @ Epoch"],
                            (to_entries[]
                             | select(.value.state!="Rejected" and .value.state!="Retired")
-                            | [.key+1, .value.mainnetBetaPubkey, .value.state, (.value.onboardingNumber // "null"), (.value.sfdp2OnboardingEpoch // "null")])
+                            | [.key+1, .value.mainnetBetaPubkey, .value.testnetPubkey, .value.state, (.value.onboardingNumber // "---"), (.value.sfdp2OnboardingEpoch // "Not Onboarded")])
                            | @csv' \
                   > data/sfdp_participants.csv
-
-                  # optional timestamped snapshot (hourly, UTC)
                   ts=$(date -u +'%Y-%m-%dT%H')
                   cp data/sfdp_participants.csv "data/sfdp_participants_${ts}.csv"
 
-            - name: Commit & push if changed
+            - name: Build PR body
+              id: diff
               shell: bash
               run: |
-                  git config user.name  "github-actions[bot]"
-                  git config user.email "github-actions[bot]@users.noreply.github.com"
+                  set -euo pipefail
+                  if git show HEAD:data/sfdp_participants.csv > old.csv 2>/dev/null; then :; else : > old.csv; fi
 
-                  if ! git diff --quiet; then
-                    git add data/*.csv
-                    git commit -m "Update SFDP CSV ($(date -u '+%Y-%m-%d %H:%M:%S UTC'))"
-                    git push
+                  # Make pubkey,state maps (strip quotes, skip header)
+                  awk -F, 'NR>1 {gsub(/"/,""); print $2","$3}' old.csv > old_map.txt || true
+                  awk -F, 'NR>1 {gsub(/"/,""); print $2","$3}' data/sfdp_participants.csv > new_map.txt
+
+                  sort -t, -k1,1 old_map.txt > old_sorted.txt || true
+                  sort -t, -k1,1 new_map.txt > new_sorted.txt
+
+                  cut -d, -f1 old_sorted.txt > old_keys.txt || true
+                  cut -d, -f1 new_sorted.txt > new_keys.txt
+
+                  : > changes_all.txt
+
+                  # New participants
+                  comm -13 old_keys.txt new_keys.txt | while read -r pk; do
+                    [ -z "$pk" ] && continue
+                    ns=$(grep -m1 "^$pk," new_sorted.txt | cut -d, -f2-)
+                    echo "${pk}: No data -> ${ns}" >> changes_all.txt
+                  done
+
+                  # State changes
+                  join -t, -j1 -o 1.1,1.2,2.2 old_sorted.txt new_sorted.txt > joined.txt || true
+                  while IFS=, read -r pk os ns; do
+                    [ -z "${pk:-}" ] && continue
+                    if [ "$os" != "$ns" ]; then
+                      echo "${pk}: ${os} -> ${ns}" >> changes_all.txt
+                    fi
+                  done < joined.txt
+
+                  if [ ! -s changes_all.txt ]; then
+                    echo "No new participants or state changes." > PR_BODY.md
                   else
-                    echo "No changes to commit."
+                    sort changes_all.txt > changes_sorted.txt
+                    TOTAL=$(wc -l < changes_sorted.txt | xargs)
+                    head -n 100 changes_sorted.txt > PR_BODY.md
+                    if [ "$TOTAL" -gt 100 ]; then
+                      echo "➕ $((TOTAL-100)) more changes" >> PR_BODY.md
+                    fi
                   fi
+
+                  SUBJECT="Update SFDP CSV ($(date -u '+%Y-%m-%d %H:%M:%S UTC'))"
+
+                  {
+                    echo "subject<<EOF"
+                    echo "$SUBJECT"
+                    echo "EOF"
+                  } >> "$GITHUB_OUTPUT"
+
+            - name: Create / Update Pull Request
+              id: cpr
+              uses: peter-evans/create-pull-request@v6
+              with:
+                  token: ${{ secrets.REPO_BOT_TOKEN }}
+                  commit-message: ${{ steps.diff.outputs.subject }}
+                  branch: bot/update-sfdp-csv
+                  title: ${{ steps.diff.outputs.subject }}
+                  body-path: PR_BODY.md
+                  labels: automated
+                  signoff: false
+                  add-paths: |
+                      data/sfdp_participants.csv
+                      data/sfdp_participants_*.csv
+
+            - name: Merge PR
+              if: steps.cpr.outputs.pull-request-number
+              uses: actions/github-script@v7
+              with:
+                  github-token: ${{ secrets.REPO_BOT_TOKEN }}
+                  script: |
+                      const fs = require('fs');
+                      const prNumber = Number('${{ steps.cpr.outputs.pull-request-number }}');
+                      const commitTitle = '${{ steps.diff.outputs.subject }}';
+                      let commitMessage = '';
+                      try {
+                        commitMessage = fs.readFileSync('PR_BODY.md', 'utf8');
+                      } catch (e) {}
+
+                      // Attempt squash merge
+                      try {
+                        await github.rest.pulls.merge({
+                          owner: context.repo.owner,
+                          repo: context.repo.repo,
+                          pull_number: prNumber,
+                          merge_method: 'squash',
+                          commit_title: commitTitle,
+                          commit_message: commitMessage
+                        });
+                        core.info(`Merged PR #${prNumber}`);
+                      } catch (err) {
+                        core.setFailed(`Merge failed for PR #${prNumber}: ${err.message}`);
+                      }
+
+            - name: Delete branch after merge (best-effort)
+              if: steps.cpr.outputs.pull-request-number
+              uses: actions/github-script@v7
+              with:
+                  github-token: ${{ secrets.REPO_BOT_TOKEN }}
+                  script: |
+                      const branch = '${{ steps.cpr.outputs.pull-request-branch || 'bot/update-sfdp-csv' }}';
+                      try {
+                        await github.rest.git.deleteRef({
+                          owner: context.repo.owner,
+                          repo: context.repo.repo,
+                          ref: `heads/${branch}`
+                        });
+                        core.info(`Deleted branch ${branch}`);
+                      } catch (e) {
+                        core.info(`Branch delete skipped/failed: ${e.message}`);
+                      }
