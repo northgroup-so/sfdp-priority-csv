@@ -25,7 +25,7 @@ jobs:
                   set -euo pipefail
                   mkdir -p data
                   curl --silent --location 'https://api.solana.org/api/community/v1/sfdp_participants' \
-                  | jq -r '["No","Mainnet Pubkey","Testnet Pubkey","state","Onboarding Priority","Onboarded @ Epoch"],
+                  | jq -r '["No","Mainnet Pubkey","Testnet Pubkey","state","Onboarding Priority","Mainnet Onboarding Epoch"],
                            (to_entries[]
                             | select(.value.state!="Rejected" and .value.state!="Retired")
                             | [.key+1, .value.mainnetBetaPubkey, .value.testnetPubkey, .value.state, (.value.onboardingNumber // "---"), (.value.sfdp2OnboardingEpoch // "Not Onboarded")])
