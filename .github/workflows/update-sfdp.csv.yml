@@ -1,8 +1,8 @@
-name: Update SFDP CSV (PR + Auto-merge)
+name: Update SFDP CSV
 
 on:
     schedule:
-        - cron: "0 */3 * * *" # every 3 hours (UTC)
+        - cron: "0 */3 * * *"
     workflow_dispatch:
 
 permissions:
@@ -33,60 +33,57 @@ jobs:
                   ts=$(date -u +'%Y-%m-%dT%H')
                   cp data/sfdp_participants.csv "data/sfdp_participants_${ts}.csv"
 
-            - name: Analyze changes (new participants & state changes)
+            - name: Analyze changes
               id: diff
               shell: bash
               run: |
                   set -euo pipefail
+                  if git show HEAD:data/sfdp_participants.csv > old.csv 2>/dev/null; then :; else : > old.csv; fi
 
-                  if git show HEAD:data/sfdp_participants.csv > old.csv 2>/dev/null; then
-                    :
-                  else
-                    : > old.csv
-                  fi
-
-                  # maps: pubkey -> state
                   awk -F, 'NR>1 {gsub(/"/,""); print $2","$3}' old.csv > old_map.txt || true
                   awk -F, 'NR>1 {gsub(/"/,""); print $2","$3}' data/sfdp_participants.csv > new_map.txt
 
-                  # create lookup files
-                  sort -t, -k1,1 old_map.txt > old_sorted.txt
+                  sort -t, -k1,1 old_map.txt > old_sorted.txt || true
                   sort -t, -k1,1 new_map.txt > new_sorted.txt
 
-                  # new participants (in new, not in old)
                   cut -d, -f1 old_sorted.txt > old_keys.txt || true
                   cut -d, -f1 new_sorted.txt > new_keys.txt
-                  comm -13 old_keys.txt new_keys.txt > new_pubkeys.txt
 
-                  BODY=""
+                  : > changes_all.txt
 
-                  # handle new participants
-                  while read -r pk; do
+                  comm -13 old_keys.txt new_keys.txt | while read -r pk; do
                     [ -z "$pk" ] && continue
-                    ns=$(grep "^$pk," new_sorted.txt | cut -d, -f2- | head -n1)
-                    BODY="${BODY}${pk}: No data -> ${ns}\n"
-                  done < new_pubkeys.txt
+                    ns=$(grep -m1 "^$pk," new_sorted.txt | cut -d, -f2-)
+                    echo "${pk}: No data -> ${ns}" >> changes_all.txt
+                  done
 
-                  # handle state changes
                   join -t, -j1 -o 1.1,1.2,2.2 old_sorted.txt new_sorted.txt > joined.txt || true
                   while IFS=, read -r pk os ns; do
+                    [ -z "${pk:-}" ] && continue
                     if [ "$os" != "$ns" ]; then
-                      BODY="${BODY}${pk}: ${os} -> ${ns}\n"
+                      echo "${pk}: ${os} -> ${ns}" >> changes_all.txt
                     fi
                   done < joined.txt
 
-                  SUBJECT="Update SFDP CSV ($(date -u '+%Y-%m-%d %H:%M:%S UTC'))"
-
-                  if [ -z "$BODY" ]; then
-                    BODY="No new participants or state changes."
+                  if [ ! -s changes_all.txt ]; then
+                    echo "No new participants or state changes." > PR_BODY.md
+                  else
+                    sort changes_all.txt > changes_sorted.txt
+                    TOTAL=$(wc -l < changes_sorted.txt | xargs)
+                    head -n 100 changes_sorted.txt > PR_BODY.md
+                    if [ "$TOTAL" -gt 100 ]; then
+                      echo "➕ $((TOTAL-100)) more changes" >> PR_BODY.md
+                    fi
                   fi
+
+                  SUBJECT="Update SFDP CSV ($(date -u '+%Y-%m-%d %H:%M:%S UTC'))"
 
                   {
                     echo "subject<<EOF"
                     echo "$SUBJECT"
                     echo "EOF"
-                    echo "body<<EOF"
-                    echo -e "$BODY"
+                    echo "body_path<<EOF"
+                    echo "PR_BODY.md"
                     echo "EOF"
                   } >> "$GITHUB_OUTPUT"
 
@@ -94,13 +91,10 @@ jobs:
               id: cpr
               uses: peter-evans/create-pull-request@v6
               with:
-                  commit-message: |
-                      ${{ steps.diff.outputs.subject }}
-
-                      ${{ steps.diff.outputs.body }}
+                  commit-message: ${{ steps.diff.outputs.subject }}
                   branch: bot/update-sfdp-csv
                   title: ${{ steps.diff.outputs.subject }}
-                  body: ${{ steps.diff.outputs.body }}
+                  body-path: ${{ steps.diff.outputs.body_path }}
                   labels: automated
                   signoff: false
                   add-paths: |
