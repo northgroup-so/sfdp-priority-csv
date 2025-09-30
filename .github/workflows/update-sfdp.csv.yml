@@ -1,4 +1,4 @@
-name: Update SFDP CSV
+name: Update SFDP CSV (PR + Auto-merge via PAT)
 
 on:
     schedule:
@@ -6,17 +6,23 @@ on:
     workflow_dispatch:
 
 permissions:
-    contents: write
-    pull-requests: write
+    contents: read
+    pull-requests: read
 
 jobs:
     update:
         runs-on: ubuntu-latest
+
         steps:
             - name: Checkout
               uses: actions/checkout@v4
               with:
                   fetch-depth: 0
+
+            - name: Install jq
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y jq
 
             - name: Generate CSV files
               shell: bash
@@ -33,13 +39,14 @@ jobs:
                   ts=$(date -u +'%Y-%m-%dT%H')
                   cp data/sfdp_participants.csv "data/sfdp_participants_${ts}.csv"
 
-            - name: Analyze changes
+            - name: Build PR body (max 100 lines, custom format)
               id: diff
               shell: bash
               run: |
                   set -euo pipefail
                   if git show HEAD:data/sfdp_participants.csv > old.csv 2>/dev/null; then :; else : > old.csv; fi
 
+                  # Make pubkey,state maps (strip quotes, skip header)
                   awk -F, 'NR>1 {gsub(/"/,""); print $2","$3}' old.csv > old_map.txt || true
                   awk -F, 'NR>1 {gsub(/"/,""); print $2","$3}' data/sfdp_participants.csv > new_map.txt
 
@@ -51,12 +58,14 @@ jobs:
 
                   : > changes_all.txt
 
+                  # New participants
                   comm -13 old_keys.txt new_keys.txt | while read -r pk; do
                     [ -z "$pk" ] && continue
                     ns=$(grep -m1 "^$pk," new_sorted.txt | cut -d, -f2-)
                     echo "${pk}: No data -> ${ns}" >> changes_all.txt
                   done
 
+                  # State changes
                   join -t, -j1 -o 1.1,1.2,2.2 old_sorted.txt new_sorted.txt > joined.txt || true
                   while IFS=, read -r pk os ns; do
                     [ -z "${pk:-}" ] && continue
@@ -82,32 +91,31 @@ jobs:
                     echo "subject<<EOF"
                     echo "$SUBJECT"
                     echo "EOF"
-                    echo "body_path<<EOF"
-                    echo "PR_BODY.md"
-                    echo "EOF"
                   } >> "$GITHUB_OUTPUT"
 
-            - name: Create/update Pull Request
+            - name: Create / Update Pull Request (using PAT)
               id: cpr
               uses: peter-evans/create-pull-request@v6
               with:
+                  token: ${{ secrets.REPO_BOT_TOKEN }} # <-- Fine-grained PAT with PR & contents write
                   commit-message: ${{ steps.diff.outputs.subject }}
                   branch: bot/update-sfdp-csv
                   title: ${{ steps.diff.outputs.subject }}
-                  body-path: ${{ steps.diff.outputs.body_path }}
+                  body-path: PR_BODY.md
                   labels: automated
                   signoff: false
                   add-paths: |
                       data/sfdp_participants.csv
                       data/sfdp_participants_*.csv
 
-            - name: Enable auto-merge (squash)
+            - name: Enable auto-merge (squash) using PAT
               if: steps.cpr.outputs.pull-request-number
               uses: actions/github-script@v7
               with:
+                  github-token: ${{ secrets.REPO_BOT_TOKEN }}
                   script: |
-                      const prNumber = Number('${{ steps.cpr.outputs.pull-request-number }}');
-                      const q = await github.graphql(
+                      const prNumber = Number(core.getInput('pr-number') || '${{ steps.cpr.outputs.pull-request-number }}');
+                      const { repository } = await github.graphql(
                         `
                         query($owner:String!,$repo:String!,$pr:Int!){
                           repository(owner:$owner, name:$repo){
@@ -117,7 +125,8 @@ jobs:
                         `,
                         { owner: context.repo.owner, repo: context.repo.repo, pr: prNumber }
                       );
-                      const prId = q.repository.pullRequest.id;
+                      const prId = repository.pullRequest.id;
+
                       await github.graphql(
                         `
                         mutation($pullRequestId:ID!){
