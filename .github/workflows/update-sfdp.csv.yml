@@ -1,12 +1,13 @@
-name: Update SFDP CSV
+name: Update SFDP CSV (PR + Auto-merge)
 
 on:
     schedule:
-        - cron: "0 */3 * * *"
+        - cron: "0 */3 * * *" # every 3 hours (UTC)
     workflow_dispatch:
 
 permissions:
     contents: write
+    pull-requests: write
 
 jobs:
     update:
@@ -37,40 +38,49 @@ jobs:
               shell: bash
               run: |
                   set -euo pipefail
+
                   if git show HEAD:data/sfdp_participants.csv > old.csv 2>/dev/null; then
                     :
                   else
                     : > old.csv
                   fi
-                  awk -F, 'NR>1 {gsub(/"/,""); print $2","$3}' old.csv | sort -t, -k1,1 > old_map.txt || true
-                  awk -F, 'NR>1 {gsub(/"/,""); print $2","$3}' data/sfdp_participants.csv | sort -t, -k1,1 > new_map.txt
-                  cut -d, -f1 old_map.txt > old_keys.txt || true
-                  cut -d, -f1 new_map.txt > new_keys.txt
-                  comm -13 <(sort old_keys.txt 2>/dev/null || true) <(sort new_keys.txt) > new_pubkeys.txt
-                  join -t, -j1 -o 1.1,1.2,2.2 old_map.txt new_map.txt > joined.txt || true
-                  awk -F, '$2 != $3 {print $1":"$2"->"$3}' joined.txt > state_changes.txt
-                  NEW_CNT=$(wc -l < new_pubkeys.txt 2>/dev/null | xargs || echo 0)
-                  CHG_CNT=$(wc -l < state_changes.txt 2>/dev/null | xargs || echo 0)
-                  list_join() { paste -sd',' -; }
-                  NEW_LIST=$( (head -n 50 new_pubkeys.txt 2>/dev/null || true) | list_join )
-                  CHG_LIST=$(head -n 50 state_changes.txt 2>/dev/null || true)
-                  if [ "${NEW_CNT:-0}" -gt 50 ]; then
-                    NEW_LIST="${NEW_LIST}, ...(+$((NEW_CNT-50)) more)"
-                  fi
-                  if [ "${CHG_CNT:-0}" -gt 50 ]; then
-                    CHG_LIST="${CHG_LIST}\n...(+$((CHG_CNT-50)) more)"
-                  fi
-                  SUBJECT="Update SFDP CSV ($(date -u '+%Y-%m-%d %H:%M:%S UTC'))"
+
+                  # maps: pubkey -> state
+                  awk -F, 'NR>1 {gsub(/"/,""); print $2","$3}' old.csv > old_map.txt || true
+                  awk -F, 'NR>1 {gsub(/"/,""); print $2","$3}' data/sfdp_participants.csv > new_map.txt
+
+                  # create lookup files
+                  sort -t, -k1,1 old_map.txt > old_sorted.txt
+                  sort -t, -k1,1 new_map.txt > new_sorted.txt
+
+                  # new participants (in new, not in old)
+                  cut -d, -f1 old_sorted.txt > old_keys.txt || true
+                  cut -d, -f1 new_sorted.txt > new_keys.txt
+                  comm -13 old_keys.txt new_keys.txt > new_pubkeys.txt
+
                   BODY=""
-                  if [ "${NEW_CNT:-0}" -gt 0 ]; then
-                    BODY="${BODY}New participants (${NEW_CNT}): ${NEW_LIST}\n"
-                  fi
-                  if [ "${CHG_CNT:-0}" -gt 0 ]; then
-                    BODY="${BODY}State changes (${CHG_CNT}):\n${CHG_LIST}\n"
-                  fi
+
+                  # handle new participants
+                  while read -r pk; do
+                    [ -z "$pk" ] && continue
+                    ns=$(grep "^$pk," new_sorted.txt | cut -d, -f2- | head -n1)
+                    BODY="${BODY}${pk}: No data -> ${ns}\n"
+                  done < new_pubkeys.txt
+
+                  # handle state changes
+                  join -t, -j1 -o 1.1,1.2,2.2 old_sorted.txt new_sorted.txt > joined.txt || true
+                  while IFS=, read -r pk os ns; do
+                    if [ "$os" != "$ns" ]; then
+                      BODY="${BODY}${pk}: ${os} -> ${ns}\n"
+                    fi
+                  done < joined.txt
+
+                  SUBJECT="Update SFDP CSV ($(date -u '+%Y-%m-%d %H:%M:%S UTC'))"
+
                   if [ -z "$BODY" ]; then
-                    BODY="No new participants or state changes detected."
+                    BODY="No new participants or state changes."
                   fi
+
                   {
                     echo "subject<<EOF"
                     echo "$SUBJECT"
@@ -80,16 +90,48 @@ jobs:
                     echo "EOF"
                   } >> "$GITHUB_OUTPUT"
 
-            - name: Commit & push with summary
-              shell: bash
-              run: |
-                  set -euo pipefail
-                  git config user.name  "github-actions[bot]"
-                  git config user.email "github-actions[bot]@users.noreply.github.com"
-                  git add data/*.csv
-                  if git diff --cached --quiet; then
-                    echo "No changes to commit."
-                  else
-                    git commit -m "${{ steps.diff.outputs.subject }}" -m "${{ steps.diff.outputs.body }}"
-                    git push
-                  fi
+            - name: Create/update Pull Request
+              id: cpr
+              uses: peter-evans/create-pull-request@v6
+              with:
+                  commit-message: |
+                      ${{ steps.diff.outputs.subject }}
+
+                      ${{ steps.diff.outputs.body }}
+                  branch: bot/update-sfdp-csv
+                  title: ${{ steps.diff.outputs.subject }}
+                  body: ${{ steps.diff.outputs.body }}
+                  labels: automated
+                  signoff: false
+                  add-paths: |
+                      data/sfdp_participants.csv
+                      data/sfdp_participants_*.csv
+
+            - name: Enable auto-merge (squash)
+              if: steps.cpr.outputs.pull-request-number
+              uses: actions/github-script@v7
+              with:
+                  script: |
+                      const prNumber = Number('${{ steps.cpr.outputs.pull-request-number }}');
+                      const q = await github.graphql(
+                        `
+                        query($owner:String!,$repo:String!,$pr:Int!){
+                          repository(owner:$owner, name:$repo){
+                            pullRequest(number:$pr){ id }
+                          }
+                        }
+                        `,
+                        { owner: context.repo.owner, repo: context.repo.repo, pr: prNumber }
+                      );
+                      const prId = q.repository.pullRequest.id;
+                      await github.graphql(
+                        `
+                        mutation($pullRequestId:ID!){
+                          enablePullRequestAutoMerge(input:{pullRequestId:$pullRequestId, mergeMethod:SQUASH}) {
+                            clientMutationId
+                          }
+                        }
+                        `,
+                        { pullRequestId: prId }
+                      );
+                      core.info(`Auto-merge enabled for PR #${prNumber}.`)
