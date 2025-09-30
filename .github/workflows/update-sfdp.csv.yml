@@ -1,0 +1,53 @@
+name: Update SFDP CSV
+
+on:
+    schedule:
+        - cron: "0 */3 * * *"
+    workflow_dispatch:
+
+permissions:
+    contents: write
+
+jobs:
+    update:
+        runs-on: ubuntu-latest
+
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+
+            - name: Install jq (ensure available)
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y jq
+
+            - name: Generate CSV files
+              shell: bash
+              run: |
+                  mkdir -p data
+                  # main CSV (overwrites)
+                  curl --silent --location 'https://api.solana.org/api/community/v1/sfdp_participants' \
+                  | jq -r '["No","Mainnet Pubkey","state","Onboarding Priority","Onboarded @ Epoch"],
+                           (to_entries[]
+                            | select(.value.state!="Rejected" and .value.state!="Retired")
+                            | [.key+1, .value.mainnetBetaPubkey, .value.state, (.value.onboardingNumber // "null"), (.value.sfdp2OnboardingEpoch // "null")])
+                           | @csv' \
+                  > data/sfdp_participants.csv
+
+                  # optional timestamped snapshot (hourly, UTC)
+                  ts=$(date -u +'%Y-%m-%dT%H')
+                  cp data/sfdp_participants.csv "data/sfdp_participants_${ts}.csv"
+
+            - name: Commit & push if changed
+              shell: bash
+              run: |
+                  git config user.name  "github-actions[bot]"
+                  git config user.email "github-actions[bot]@users.noreply.github.com"
+
+                  if ! git diff --quiet; then
+                    git add data/*.csv
+                    git commit -m "Update SFDP CSV ($(date -u '+%Y-%m-%d %H:%M:%S UTC'))"
+                    git push
+                  else
+                    echo "No changes to commit."
+                  fi
