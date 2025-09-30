@@ -1,151 +1,171 @@
 name: Update SFDP CSV
 
 on:
-    schedule:
-        - cron: "0 */3 * * *"
-    workflow_dispatch:
+  schedule:
+    - cron: "0 */3 * * *"
+  workflow_dispatch:
 
 permissions:
-    contents: read
-    pull-requests: read
+  contents: read
+  pull-requests: read
 
 jobs:
-    update:
-        runs-on: ubuntu-latest
+  update:
+    runs-on: ubuntu-latest
 
-        steps:
-            - name: Checkout
-              uses: actions/checkout@v4
-              with:
-                  fetch-depth: 0
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-            - name: Generate CSV files
-              shell: bash
-              run: |
-                  set -euo pipefail
-                  mkdir -p data
-                  curl --silent --location 'https://api.solana.org/api/community/v1/sfdp_participants' \
-                  | jq -r '["No","Mainnet Pubkey","Testnet Pubkey","state","Onboarding Priority","Mainnet Onboarding Epoch"],
-                           (to_entries[]
-                            | select(.value.state!="Rejected" and .value.state!="Retired")
-                            | [.key+1, .value.mainnetBetaPubkey, .value.testnetPubkey, .value.state, (.value.onboardingNumber // "---"), (.value.sfdp2OnboardingEpoch // "Not Onboarded")])
-                           | @csv' \
-                  > data/sfdp_participants.csv
-                  ts=$(date -u +'%Y-%m-%dT%H')
-                  cp data/sfdp_participants.csv "data/sfdp_participants_${ts}.csv"
+      - name: Generate CSV files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data
+          curl --silent --location 'https://api.solana.org/api/community/v1/sfdp_participants' \
+          | jq -r '
+              # print header first
+              (["Mainnet Pubkey","Testnet Pubkey","state","Onboarding Priority","Mainnet Onboarding Epoch"] | @csv),
+              (
+                [ .[] | select(.state!="Rejected" and .state!="Retired") ]
+                | sort_by(
+                    # primary: flag null onboardingNumber first
+                    (if .onboardingNumber == null then 0 else 1 end),
+                    # secondary: if null, sort by -epoch (so higher epoch first), else by onboardingNumber asc
+                    (if .onboardingNumber == null
+                    then -((.sfdp2OnboardingEpoch // 0))
+                    else (.onboardingNumber | tonumber? // 0)
+                    end)
+                  )
+                | .[]
+                | [ .mainnetBetaPubkey,
+                    .testnetPubkey,
+                    .state,
+                    (.onboardingNumber // "---"),
+                    (.sfdp2OnboardingEpoch // "Not Onboarded")
+                  ]
+                | @csv
+              )
+            ' \
+          > data/sfdp_participants.csv
 
-            - name: Build PR body
-              id: diff
-              shell: bash
-              run: |
-                  set -euo pipefail
-                  if git show HEAD:data/sfdp_participants.csv > old.csv 2>/dev/null; then :; else : > old.csv; fi
+          ts=$(date -u +'%Y-%m-%dT%H')
+          cp data/sfdp_participants.csv "data/sfdp_participants_${ts}.csv"
 
-                  # Make pubkey,state maps (strip quotes, skip header)
-                  awk -F, 'NR>1 {gsub(/"/,""); print $2","$3}' old.csv > old_map.txt || true
-                  awk -F, 'NR>1 {gsub(/"/,""); print $2","$3}' data/sfdp_participants.csv > new_map.txt
+      - name: Build PR body
+        id: diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git show HEAD:data/sfdp_participants.csv > old.csv 2>/dev/null; then :; else : > old.csv; fi
 
-                  sort -t, -k1,1 old_map.txt > old_sorted.txt || true
-                  sort -t, -k1,1 new_map.txt > new_sorted.txt
+          # Make pubkey,state maps (strip quotes, skip header)
+          awk -F, 'NR>1 {gsub(/"/,""); print $2","$3}' old.csv > old_map.txt || true
+          awk -F, 'NR>1 {gsub(/"/,""); print $2","$3}' data/sfdp_participants.csv > new_map.txt
 
-                  cut -d, -f1 old_sorted.txt > old_keys.txt || true
-                  cut -d, -f1 new_sorted.txt > new_keys.txt
+          sort -t, -k1,1 old_map.txt > old_sorted.txt || true
+          sort -t, -k1,1 new_map.txt > new_sorted.txt
 
-                  : > changes_all.txt
+          cut -d, -f1 old_sorted.txt > old_keys.txt || true
+          cut -d, -f1 new_sorted.txt > new_keys.txt
 
-                  # New participants
-                  comm -13 old_keys.txt new_keys.txt | while read -r pk; do
-                    [ -z "$pk" ] && continue
-                    ns=$(grep -m1 "^$pk," new_sorted.txt | cut -d, -f2-)
-                    echo "${pk}: No data -> ${ns}" >> changes_all.txt
-                  done
+          : > changes_all.txt
 
-                  # State changes
-                  join -t, -j1 -o 1.1,1.2,2.2 old_sorted.txt new_sorted.txt > joined.txt || true
-                  while IFS=, read -r pk os ns; do
-                    [ -z "${pk:-}" ] && continue
-                    if [ "$os" != "$ns" ]; then
-                      echo "${pk}: ${os} -> ${ns}" >> changes_all.txt
-                    fi
-                  done < joined.txt
+          # New participants
+          comm -13 old_keys.txt new_keys.txt | while read -r pk; do
+            [ -z "$pk" ] && continue
+            ns=$(grep -m1 "^$pk," new_sorted.txt | cut -d, -f3-)
+            echo "${pk}: No data -> ${ns}" >> changes_all.txt
+          done
 
-                  if [ ! -s changes_all.txt ]; then
-                    echo "No new participants or state changes." > PR_BODY.md
-                  else
-                    sort changes_all.txt > changes_sorted.txt
-                    TOTAL=$(wc -l < changes_sorted.txt | xargs)
-                    head -n 100 changes_sorted.txt > PR_BODY.md
-                    if [ "$TOTAL" -gt 100 ]; then
-                      echo "➕ $((TOTAL-100)) more changes" >> PR_BODY.md
-                    fi
-                  fi
+          # State changes
+          join -t, -j1 -o 1.1,1.2,2.2 old_sorted.txt new_sorted.txt > joined.txt || true
+          while IFS=, read -r pk os ns; do
+            [ -z "${pk:-}" ] && continue
+            if [ "$os" != "$ns" ]; then
+              echo "${pk}: ${os} -> ${ns}" >> changes_all.txt
+            fi
+          done < joined.txt
 
-                  SUBJECT="Update SFDP CSV ($(date -u '+%Y-%m-%d %H:%M:%S UTC'))"
+          if [ ! -s changes_all.txt ]; then
+            echo "No new participants or state changes." > PR_BODY.md
+          else
+            sort changes_all.txt > changes_sorted.txt
+            TOTAL=$(wc -l < changes_sorted.txt | xargs)
+            head -n 100 changes_sorted.txt > PR_BODY.md
+            if [ "$TOTAL" -gt 100 ]; then
+              echo "➕ $((TOTAL-100)) more changes" >> PR_BODY.md
+            fi
+          fi
 
-                  {
-                    echo "subject<<EOF"
-                    echo "$SUBJECT"
-                    echo "EOF"
-                  } >> "$GITHUB_OUTPUT"
+          SUBJECT="Update SFDP CSV ($(date -u '+%Y-%m-%d %H:%M:%S UTC'))"
 
-            - name: Create / Update Pull Request
-              id: cpr
-              uses: peter-evans/create-pull-request@v6
-              with:
-                  token: ${{ secrets.REPO_BOT_TOKEN }}
-                  commit-message: ${{ steps.diff.outputs.subject }}
-                  branch: bot/update-sfdp-csv
-                  title: ${{ steps.diff.outputs.subject }}
-                  body-path: PR_BODY.md
-                  labels: automated
-                  signoff: false
-                  add-paths: |
-                      data/sfdp_participants.csv
-                      data/sfdp_participants_*.csv
+          {
+            echo "subject<<EOF"
+            echo "$SUBJECT"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
-            - name: Merge PR
-              if: steps.cpr.outputs.pull-request-number
-              uses: actions/github-script@v7
-              with:
-                  github-token: ${{ secrets.REPO_BOT_TOKEN }}
-                  script: |
-                      const fs = require('fs');
-                      const prNumber = Number('${{ steps.cpr.outputs.pull-request-number }}');
-                      const commitTitle = '${{ steps.diff.outputs.subject }}';
-                      let commitMessage = '';
-                      try {
-                        commitMessage = fs.readFileSync('PR_BODY.md', 'utf8');
-                      } catch (e) {}
+      - name: Create / Update Pull Request
+        id: cpr
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.REPO_BOT_TOKEN }}
+          commit-message: ${{ steps.diff.outputs.subject }}
+          branch: bot/update-sfdp-csv
+          title: ${{ steps.diff.outputs.subject }}
+          body-path: PR_BODY.md
+          labels: automated
+          signoff: false
+          add-paths: |
+            data/sfdp_participants.csv
+            data/sfdp_participants_*.csv
 
-                      // Attempt squash merge
-                      try {
-                        await github.rest.pulls.merge({
-                          owner: context.repo.owner,
-                          repo: context.repo.repo,
-                          pull_number: prNumber,
-                          merge_method: 'squash',
-                          commit_title: commitTitle,
-                          commit_message: commitMessage
-                        });
-                        core.info(`Merged PR #${prNumber}`);
-                      } catch (err) {
-                        core.setFailed(`Merge failed for PR #${prNumber}: ${err.message}`);
-                      }
+      - name: Merge PR
+        if: steps.cpr.outputs.pull-request-number
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.REPO_BOT_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const prNumber = Number('${{ steps.cpr.outputs.pull-request-number }}');
+            const commitTitle = '${{ steps.diff.outputs.subject }}';
+            let commitMessage = '';
+            try {
+              commitMessage = fs.readFileSync('PR_BODY.md', 'utf8');
+            } catch (e) {}
 
-            - name: Delete branch after merge (best-effort)
-              if: steps.cpr.outputs.pull-request-number
-              uses: actions/github-script@v7
-              with:
-                  github-token: ${{ secrets.REPO_BOT_TOKEN }}
-                  script: |
-                      const branch = '${{ steps.cpr.outputs.pull-request-branch || 'bot/update-sfdp-csv' }}';
-                      try {
-                        await github.rest.git.deleteRef({
-                          owner: context.repo.owner,
-                          repo: context.repo.repo,
-                          ref: `heads/${branch}`
-                        });
-                        core.info(`Deleted branch ${branch}`);
-                      } catch (e) {
-                        core.info(`Branch delete skipped/failed: ${e.message}`);
-                      }
+            // Attempt squash merge
+            try {
+              await github.rest.pulls.merge({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+                merge_method: 'squash',
+                commit_title: commitTitle,
+                commit_message: commitMessage
+              });
+              core.info(`Merged PR #${prNumber}`);
+            } catch (err) {
+              core.setFailed(`Merge failed for PR #${prNumber}: ${err.message}`);
+            }
+
+      - name: Delete branch after merge (best-effort)
+        if: steps.cpr.outputs.pull-request-number
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.REPO_BOT_TOKEN }}
+          script: |
+            const branch = '${{ steps.cpr.outputs.pull-request-branch || 'bot/update-sfdp-csv' }}';
+            try {
+              await github.rest.git.deleteRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: `heads/${branch}`
+              });
+              core.info(`Deleted branch ${branch}`);
+            } catch (e) {
+              core.info(`Branch delete skipped/failed: ${e.message}`);
+            }
